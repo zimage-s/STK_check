@@ -107,11 +107,30 @@ def fetch_stk(vin):
         if m:
             pristi_stk = m.group(1)
 
+    # Parsování značky/druhu vozidla z první detailní tabulky
+    web_znacka = web_druh = ""
+    detail_tables = soup.find_all("table")
+    for dt in detail_tables:
+        if dt.get("id") == "resultsTable":
+            continue
+        for tr in dt.find_all("tr"):
+            cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+            if len(cells) == 2:
+                key = cells[0].lower()
+                if "značka" in key and "model" in key:
+                    web_znacka = re.sub(r"\s+", " ", cells[1]).strip()
+                elif "druh" in key and "kategori" in key:
+                    web_druh = re.sub(r"\s+", " ", cells[1]).strip()
+        if web_znacka:
+            break
+
     result = {
-        "records":     records,
-        "pristi_stk":  pristi_stk,
-        "zbyva_dni":   pristi_match.group(2) if pristi_match else None,
+        "records":      records,
+        "pristi_stk":   pristi_stk,
+        "zbyva_dni":    pristi_match.group(2) if pristi_match else None,
         "po_lhute_dni": po_lhute_match.group(1) if po_lhute_match else None,
+        "web_znacka":   web_znacka,
+        "web_druh":     web_druh,
     }
     if latest:
         result["posledni_datum"]    = latest["datum"]
@@ -125,6 +144,24 @@ def fetch_stk(vin):
         result["posledni_druh"]     = records[0]["druh"]
 
     return result, None
+
+
+def check_vehicle_match(car, stk_data):
+    """Compare vehicle brand from XLSX vs web. Returns mismatch description or None."""
+    web = stk_data.get("web_znacka", "").upper()
+    if not web:
+        return None
+    xlsx_brand = car["brand"].upper().strip()
+    # Normalize common variants
+    norm = {"ŠKODA": "SKODA", "ŠKODA": "SKODA"}
+    wb = norm.get(xlsx_brand, xlsx_brand)
+    # Check if XLSX brand appears anywhere in web response
+    web_norm = web.replace("Š", "S").replace("š", "s").upper()
+    wb_norm = wb.replace("Š", "S").replace("š", "s")
+    if wb_norm and wb_norm in web_norm:
+        return None
+    web_druh = stk_data.get("web_druh", "")
+    return f"v tabulce '{car['brand']} {car['model']}', web vrací '{web}' ({web_druh})"
 
 
 def cmd_stahni(only_vin=None):
@@ -165,6 +202,11 @@ def cmd_stahni(only_vin=None):
                 print(f"⛔ PO LHŮTĚ {po} dní | {n} záz.")
             else:
                 print(f"✅ příští: {data.get('pristi_stk','?')} | {n} záz.")
+
+            mismatch = check_vehicle_match(car, data)
+            if mismatch:
+                print(f"     ⚠️  NESOUHLASÍ: {mismatch}")
+
             all_data[car["vin"]] = data
             ok += 1
 
@@ -225,10 +267,15 @@ def cmd_xlsx():
                                car["rz"], car["vin"], car["year"]], 1):
             ws.cell(row=r, column=c, value=v).border = brd
 
-        if res is None:
-            note = err_msg or "Žádné záznamy v DB"
-            ws.cell(row=r, column=15, value=note).border = brd
-            ws.cell(row=r, column=15).fill = gry_f
+        mismatch = check_vehicle_match(car, res) if res else None
+
+        if res is None or mismatch:
+            note = mismatch or err_msg or "Žádné záznamy v DB"
+            nc = ws.cell(row=r, column=15, value=note)
+            nc.border = brd
+            nc.fill = bad_f if mismatch else gry_f
+            if mismatch:
+                nc.font = Font(bold=True, color="CC0000")
             for c in range(7, 15):
                 ws.cell(row=r, column=c, value="—").border = brd
             continue
@@ -303,6 +350,8 @@ def cmd_xlsx():
     for car in cars:
         raw = all_data.get(car["vin"])
         if not raw or "error" in (raw or {}):
+            continue
+        if check_vehicle_match(car, raw):
             continue
         for rec in raw.get("records", []):
             for c, v in enumerate([car["num"], car["brand"], car["model"],
