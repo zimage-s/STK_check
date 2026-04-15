@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Kontrola STK vozidel z XLSX souboru přes kontrolatachaku.cz
+Kontrola STK vozidel z XLSX souboru.
+
+Primární zdroj: API Ministerstva dopravy (dataovozidlech.cz)
+Fallback:       kontrolatachaku.cz (pro VINy, které API nezná)
 
 Použití:
-  python3 stk_check.py stahni              # stáhne STK data z webu → uloží do stk_data.json
+  python3 stk_check.py stahni              # stáhne STK data → uloží do stk_data.json
   python3 stk_check.py xlsx                # z stk_data.json vygeneruje STK_vysledky.xlsx
   python3 stk_check.py stahni xlsx         # obojí najednou
   python3 stk_check.py stahni --vin VIN    # stáhne jen jedno auto podle VIN (doplní do JSONu)
@@ -22,6 +25,18 @@ from datetime import datetime, date
 INPUT_FILE = "Přehled vozidel Ing. Pavel Zima.xlsx"
 OUTPUT_FILE = "STK_vysledky.xlsx"
 DATA_FILE = "stk_data.json"
+
+MD_API_URL = "https://api.dataovozidlech.cz/api/vehicletechnicaldata/v2"
+CONFIG_FILE = "config.json"
+
+def _load_api_key():
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            return json.load(f).get("md_api_key", "")
+    except FileNotFoundError:
+        return ""
+
+MD_API_KEY = _load_api_key()
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
@@ -50,10 +65,86 @@ def load_cars():
 
 
 # ---------------------------------------------------------------------------
-#  Stažení STK dat z webu
+#  Stažení STK dat — oficiální API MD ČR
 # ---------------------------------------------------------------------------
 
-def fetch_stk(vin):
+def fetch_stk_api(vin):
+    """Dotaz na API Ministerstva dopravy (dataovozidlech.cz)."""
+    r = requests.get(
+        MD_API_URL,
+        params={"vin": vin},
+        headers={"api_key": MD_API_KEY},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        return None, f"API HTTP {r.status_code}"
+
+    resp = r.json()
+    d = resp.get("Data")
+    if not d:
+        status = resp.get("Status", "?")
+        return None, f"API nenalezeno (status {status})"
+
+    znacka = d.get("TovarniZnacka", "")
+    model = d.get("ObchodniOznaceni", "")
+    typ = d.get("Typ", "")
+    web_znacka = " ".join(filter(None, [znacka, model, typ])).strip()
+    web_druh = " ".join(filter(None, [
+        d.get("VozidloDruh", ""),
+        d.get("VozidloDruh2", ""),
+    ])).strip()
+    kategorie = d.get("Kategorie", "")
+    if kategorie:
+        web_druh = f"{web_druh} ({kategorie})".strip()
+
+    pristi_stk = None
+    zbyva_dni = None
+    po_lhute_dni = None
+    stk_raw = d.get("PravidelnaTechnickaProhlidkaDo")
+    if stk_raw:
+        try:
+            stk_date = datetime.fromisoformat(stk_raw).date()
+            pristi_stk = stk_date.strftime("%d.%m.%Y")
+            delta = (stk_date - date.today()).days
+            if delta < 0:
+                po_lhute_dni = str(abs(delta))
+            else:
+                zbyva_dni = f"{delta} dní"
+        except (ValueError, TypeError):
+            pass
+
+    result = {
+        "records": [],
+        "pristi_stk": pristi_stk,
+        "zbyva_dni": zbyva_dni,
+        "po_lhute_dni": po_lhute_dni,
+        "web_znacka": web_znacka,
+        "web_druh": web_druh,
+        "zdroj": "api.dataovozidlech.cz",
+        "api_data": {
+            "znacka": znacka,
+            "model": model,
+            "typ": typ,
+            "druh": d.get("VozidloDruh", ""),
+            "druh2": d.get("VozidloDruh2", ""),
+            "kategorie": kategorie,
+            "status": d.get("StatusNazev", ""),
+            "barva": d.get("VozidloKaroserieBarva", ""),
+            "cislo_tp": d.get("CisloTp", ""),
+            "datum_prvni_registrace": d.get("DatumPrvniRegistrace", ""),
+            "datum_registrace_cr": d.get("DatumPrvniRegistraceVCr", ""),
+            "pocet_vlastniku": d.get("PocetVlastniku", ""),
+        },
+    }
+    return result, None
+
+
+# ---------------------------------------------------------------------------
+#  Stažení STK dat — fallback přes kontrolatachaku.cz
+# ---------------------------------------------------------------------------
+
+def fetch_stk_web(vin):
+    """Scraping z kontrolatachaku.cz (pro VINy, které API nezná)."""
     session = requests.Session()
     session.headers.update({"User-Agent": UA})
 
@@ -86,7 +177,6 @@ def fetch_stk(vin):
                 "vysledek": cells[4].get_text(strip=True),
             })
 
-    # Poslední skutečná STK (ne evidenční kontrola)
     stk_only = [r for r in records if "videnc" not in r["druh"].lower() and "videnčn" not in r["druh"].lower()]
     latest = stk_only[0] if stk_only else None
 
@@ -107,7 +197,6 @@ def fetch_stk(vin):
         if m:
             pristi_stk = m.group(1)
 
-    # Parsování značky/druhu vozidla z první detailní tabulky
     web_znacka = web_druh = ""
     detail_tables = soup.find_all("table")
     for dt in detail_tables:
@@ -131,6 +220,7 @@ def fetch_stk(vin):
         "po_lhute_dni": po_lhute_match.group(1) if po_lhute_match else None,
         "web_znacka":   web_znacka,
         "web_druh":     web_druh,
+        "zdroj":        "kontrolatachaku.cz",
     }
     if latest:
         result["posledni_datum"]    = latest["datum"]
@@ -144,6 +234,17 @@ def fetch_stk(vin):
         result["posledni_druh"]     = records[0]["druh"]
 
     return result, None
+
+
+def fetch_stk(vin):
+    """Zkusí API MD, při neúspěchu fallback na kontrolatachaku.cz."""
+    data, err = fetch_stk_api(vin)
+    if data:
+        return data, None
+    data_web, err_web = fetch_stk_web(vin)
+    if data_web:
+        return data_web, None
+    return None, err_web or err
 
 
 def check_vehicle_match(car, stk_data):
@@ -168,7 +269,6 @@ def cmd_stahni(only_vin=None):
     cars = load_cars()
     print(f"Načteno {len(cars)} vozidel z {INPUT_FILE}")
 
-    # Načíst existující data (pokud existují)
     try:
         with open(DATA_FILE, encoding="utf-8") as f:
             all_data = json.load(f)
@@ -183,25 +283,32 @@ def cmd_stahni(only_vin=None):
         print(f"Stahuji jen VIN: {only_vin}")
 
     ok = err = 0
+    last_was_web = False
     for i, car in enumerate(cars):
         label = f"{car['brand']} {car['model']}".strip()
         print(f"[{i+1:2}/{len(cars)}] {label:<30} RZ: {car['rz']:<10} VIN: {car['vin']:<22} ", end="", flush=True)
 
-        if i > 0:
+        if last_was_web:
             time.sleep(3)
 
         data, error = fetch_stk(car["vin"])
+        last_was_web = data is not None and data.get("zdroj") == "kontrolatachaku.cz"
+        if data is None and error:
+            last_was_web = True
+
         if error:
             print(f"⚠ {error}")
             all_data[car["vin"]] = {"error": error}
             err += 1
         else:
             po = data.get("po_lhute_dni")
-            n  = len(data.get("records", []))
+            zdroj = data.get("zdroj", "?")
+            src = "API" if "api" in zdroj else "WEB"
+            n = len(data.get("records", []))
             if po:
-                print(f"⛔ PO LHŮTĚ {po} dní | {n} záz.")
+                print(f"⛔ PO LHŮTĚ {po} dní [{src}]")
             else:
-                print(f"✅ příští: {data.get('pristi_stk','?')} | {n} záz.")
+                print(f"✅ příští: {data.get('pristi_stk','?')} [{src}]")
 
             mismatch = check_vehicle_match(car, data)
             if mismatch:
@@ -280,6 +387,7 @@ def cmd_xlsx():
                 ws.cell(row=r, column=c, value="—").border = brd
             continue
 
+        is_api = res.get("zdroj", "") == "api.dataovozidlech.cz"
         ws.cell(row=r, column=7,  value=res.get("posledni_datum", "—")).border = brd
         ws.cell(row=r, column=8,  value=res.get("posledni_druh", "—")).border = brd
         ws.cell(row=r, column=9,  value=res.get("posledni_vysledek", "—")).border = brd
@@ -289,7 +397,6 @@ def cmd_xlsx():
         po_lhute = res.get("po_lhute_dni")
         zbyva    = res.get("zbyva_dni")
 
-        # Dopočítat z data, pokud chybí oba údaje
         p = res.get("pristi_stk")
         if p and not po_lhute and not zbyva:
             try:
@@ -329,8 +436,13 @@ def cmd_xlsx():
         zc.border = sc.border = brd
 
         n = len(res.get("records", []))
-        ws.cell(row=r, column=14, value=n).border = brd
-        ws.cell(row=r, column=15, value="").border = brd
+        ws.cell(row=r, column=14, value=n if n else "—").border = brd
+        zdroj = res.get("zdroj", "")
+        note = "API MD" if "api" in zdroj else "web"
+        api_d = res.get("api_data")
+        if api_d and api_d.get("status"):
+            note += f" | {api_d['status']}"
+        ws.cell(row=r, column=15, value=note).border = brd
 
     widths = [5, 12, 20, 12, 22, 8, 14, 18, 12, 14, 14, 20, 14, 10, 22]
     for c, w in enumerate(widths, 1):
